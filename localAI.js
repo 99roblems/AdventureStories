@@ -12,6 +12,16 @@ function announceAIStatus(message) {
 }
 
 /**
+ * No provider answered (timeout, network, quota, bad key): ui.js shows it,
+ * whichever call it was. `notified` = the player was told (the listener
+ * cancels the event), so callers don't show a second popup.
+ */
+function announceAIError(error) {
+    if (!(error.network || error.exhausted || error.failure)) return; // unusable replies: the caller retries
+    try { error.notified = !globalThis.dispatchEvent?.(new CustomEvent('adv:ai-error', { detail: error.message, cancelable: true })); } catch (_) { /* no DOM */ }
+}
+
+/**
  * What a failed reply means and how long that provider should rest. From the
  * documented codes (read 2026-10-08): Google AI Studio "API errors" page,
  * Groq "Rate limits" headers, OpenRouter "Errors" page.
@@ -131,7 +141,10 @@ export class LocalAIClient {
         const ranked = Router.rank(chain.map(x => x.id));
         const order = ranked.map(id => byId.get(id));
         order.race = ranked.race;
-        const { p, out } = await this.hedgedRace(order, messages, options);
+        let won;
+        try { won = await this.hedgedRace(order, messages, options); }
+        catch (e) { announceAIError(e); throw e; }
+        const { p, out } = won;
         if (this.activeName !== p.name) {
             if (this.activeName) announceAIStatus(`Storyteller switched to ${p.name}.`);
             this.activeName = p.name;
@@ -143,6 +156,7 @@ export class LocalAIClient {
         const cancel = new AbortController();
         const started = [];
         let next = 0, running = 0, done = false, lastError;
+        const failures = []; // "OpenRouter: no answer within 45 s", one per provider that failed
         return new Promise((resolve, reject) => {
             const finish = (fn) => { done = true; cancel.abort(); fn(); };
             const launch = () => {
@@ -182,6 +196,7 @@ export class LocalAIClient {
                     const f = error.failure || (error.network || error.exhausted ? { kind: 'timeout', why: 'no answer (network or timeout)', until: now + 60e3 }
                         : /No response generated|max_tokens reached|unusable reply/.test(error.message) ? { kind: 'bad_reply', why: 'unusable reply', until: now + 60e3 } : null);
                     const movable = !!f;
+                    failures.push(`${p.name.split(' — ')[0]}: ${f?.why || String(error.message).slice(0, 120)}`);
                     Router.record(id, { ok: false, ms: now - t0, now, benchUntil: f?.until || 0, why: f?.why });
                     if (movable && !successorUp && next < order.length) {
                         successorUp = true;
@@ -189,7 +204,11 @@ export class LocalAIClient {
                         announceAIStatus(`${p.name} is busy; switching storyteller...`);
                         launch();
                     }
-                    if (running === 0) finish(() => reject(lastError));
+                    if (running === 0) finish(() => {
+                        // Every provider failed: name each one, not just the last.
+                        if (failures.length > 1) lastError.message = `No storyteller answered (${failures.join('; ')}). Your choices are still there; try again in a moment.`;
+                        reject(lastError);
+                    });
                 });
                 return true;
             };
@@ -231,16 +250,19 @@ export class LocalAIClient {
     async executeRequest(requestData, provider, apiKey, retries = 0, hasNext = false, signal = null) {
         const { TIMEOUT_MS, MAX_RETRIES, RETRY_DELAY_MS } = Config.AI_REQUEST_CONFIG;
         const started = Date.now();
-        const aiLog = (msg) => (globalThis.displayVisualError || console.log)(`AI ${provider.name.split(' — ')[0]} ${provider.model}: ${msg} (${Date.now() - started} ms)`);
+        const who = provider.name.split(' — ')[0];
+        const aiLog = (msg) => (globalThis.displayVisualError || console.log)(`AI ${who} ${provider.model}: ${msg} (${Date.now() - started} ms)`);
+        // A provider with a backup behind it gets less time: a stuck call
+        // (live: Gemma hung 45 s, then two 500s) shouldn't hold up the turn.
+        // 10 s: phone run 10-08, Gemini p95 8.3 s but 4 of 20 calls stalled
+        // to the old 20 s cutoff (turn 1 took 76 s across both keys).
+        const limitMs = hasNext ? Math.min(TIMEOUT_MS, 10000) : TIMEOUT_MS;
+        let timedOut = false;
         try {
             const controller = new AbortController();
             // The race was won elsewhere: stop this request too.
             if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener('abort', () => controller.abort(), { once: true }); }
-            // A provider with a backup behind it gets less time: a stuck call
-            // (live: Gemma hung 45 s, then two 500s) shouldn't hold up the turn.
-            // 10 s: phone run 10-08, Gemini p95 8.3 s but 4 of 20 calls stalled
-            // to the old 20 s cutoff (turn 1 took 76 s across both keys).
-            const timeoutId = setTimeout(() => controller.abort(), hasNext ? Math.min(TIMEOUT_MS, 10000) : TIMEOUT_MS);
+            const timeoutId = setTimeout(() => { timedOut = true; controller.abort(); }, limitMs);
             const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
             if (provider.baseUrl.includes('openrouter')) {
                 headers['HTTP-Referer'] = (typeof window !== 'undefined' && window.location) ? window.location.origin : 'https://adventure-stories.local';
@@ -284,7 +306,7 @@ export class LocalAIClient {
             clearTimeout(timeoutId);
             aiLog(`200 in=${result.usage?.prompt_tokens ?? '?'} out=${result.usage?.completion_tokens ?? '?'}`);
             const choice = result.choices?.[0];
-            if (!choice) throw new Error('No response generated');
+            if (!choice) throw new Error(result?.error?.message ? `No response generated (${String(result.error.message).slice(0, 120)})` : 'No response generated');
             // Only the answer counts; a model's reasoning text is never story.
             const msg = choice.message || {};
             if (!msg.content && choice.finish_reason === 'length') {
@@ -295,7 +317,13 @@ export class LocalAIClient {
             if (signal?.aborted) throw error; // cancelled: another provider answered
             const isNetworkError = error.name === 'AbortError' || error.name === 'TypeError'
                 || (error.message || '').toLowerCase().includes('failed to fetch');
-            if (isNetworkError) error.network = true;
+            if (isNetworkError) {
+                // Say which provider and what happened: "This operation was aborted"
+                // was all a timed-out OpenRouter call used to show (#1).
+                const why = timedOut ? `no answer within ${Math.round(limitMs / 1000)} s` : 'could not connect';
+                error = Object.assign(new Error(timedOut ? `${who} didn't answer within ${Math.round(limitMs / 1000)} s` : `Couldn't connect to ${who} (${error.message})`, { cause: error }),
+                    { network: true, failure: { kind: 'timeout', why, until: Date.now() + 60e3 } });
+            }
             const shouldRetry = isNetworkError || error.retryable === true;
             aiLog(`failed attempt ${retries + 1}: ${String(error.message).slice(0, 160)}`);
             // With another provider waiting, fail over now: retrying a timed-out,

@@ -1548,6 +1548,18 @@ globalThis.addEventListener?.('adv:ai-status', (e) => {
     }
 });
 
+// No provider answered (timeout, network, quota, bad key), on any call: story,
+// choices, ending, spells. They used to fail with nothing on screen (#1).
+// preventDefault tells localAI the player was told; the same text shows once per 15 s.
+let lastAIError = { text: '', at: 0 };
+globalThis.addEventListener?.('adv:ai-error', (e) => {
+    e.preventDefault();
+    const text = `⚠️ The storyteller couldn't answer: ${e.detail}`;
+    if (text === lastAIError.text && Date.now() - lastAIError.at < 15000) return;
+    lastAIError = { text, at: Date.now() };
+    showPopup(text, 'error', 7000);
+});
+
 /** Show (or hide, with empty text) the one-line result of the last turn. */
 export function showTurnRecap(text) {
     if (!elements.turnRecap) return;
