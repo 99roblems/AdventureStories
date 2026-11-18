@@ -290,7 +290,7 @@ ${buildDiffInstructions(pIdx)}`;
             payload = await API.getAIResponseJSON(messages, storyTurnSchema, { jsonSchemaName: 'story_turn', max_tokens: 2000, temperature: 0.8 });
             validateNarrativeTurnPayload(payload);
         } catch (firstErr) {
-            if (firstErr.httpStatus !== undefined) throw firstErr;
+            if (firstErr.httpStatus !== undefined || firstErr.notified) throw firstErr; // no provider answered: retrying only doubles the wait
             log(`Turn reply unusable (${firstErr.message}); retrying once.`);
             payload = await API.getAIResponseJSON(messages, storyTurnSchema, { jsonSchemaName: 'story_turn', max_tokens: 2000, temperature: 0.6 });
         }
@@ -415,7 +415,7 @@ ${buildDiffInstructions(pIdx)}`;
     } catch (error) {
         log(`processAIResponse failed: ${error.message}`);
         UI.showLoading(false);
-        throw new Error(`AI processing failed: ${error.message}`);
+        throw Object.assign(new Error(`AI processing failed: ${error.message}`), { notified: error.notified });
     }
 }
 
@@ -1149,7 +1149,7 @@ This opening may run up to half again the READING LEVEL length, but its sentence
         // Say what went wrong (quota, bad key, network) instead of quietly
         // swapping in stock choices, and put the previous choices back so the
         // player can simply try again. The turn does not advance.
-        UI.showPopup(`The storyteller couldn't answer: ${error.message}`, 'error');
+        if (!error.notified) UI.showPopup(`The storyteller couldn't answer: ${error.message}`, 'error'); // a connection failure was shown already (adv:ai-error)
         const previous = Array.isArray(gameState.currentChoices) && gameState.currentChoices.length
             ? gameState.currentChoices : null;
         const defaultChoices = previous || validateAndFixChoices([], gameState.inCombat);

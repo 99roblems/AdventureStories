@@ -241,7 +241,8 @@ const ok = (who) => () => ({ status: 200, body: { choices: [{ message: { content
   localAI.setApiKey('groq-key', 'groq_qwen');
   check(!Router.isBenched(GQ), 'saving a new key for it clears the rest');
 }
-// Review 10-08 #1: a non-Groq provider (no remaining-requests header) that
+
+// Review 10-08 #1: a non-Groq provider (no remaining-requests header) that
 // answers must leave its rest. null <= 0 is true in JS, so it never did.
 {
   Router.reset();
@@ -264,6 +265,37 @@ const ok = (who) => () => ({ status: 200, body: { choices: [{ message: { content
   check(snap.restingUntil > Date.now() + 3600e3 && /used up/.test(snap.why), `Google daily quota (marker after 500 chars) rests until the reset, not 60 s (${snap.why})`);
   const minute = classifyFailure(429, '{"error":{"message":"Resource has been exhausted (e.g. check quota). Please retry in 39.1s."}}', null, C.CLOUD_PROVIDERS.flashlite_google, 1000);
   check(minute.kind === 'rate' && minute.until === 1000 + 39100, `Google per-minute 429 waits the "retry in 39.1s" it asks for (${minute.until - 1000} ms)`);
+}
+// #1: an OpenRouter call that never answers ended with "This operation was
+// aborted" and nothing on screen. The error names the provider and the
+// timeout, and reaches ui.js as adv:ai-error (which marks it notified).
+{
+  const bus = new EventTarget(), shown = [];
+  const [ael, de] = [globalThis.addEventListener, globalThis.dispatchEvent];
+  globalThis.addEventListener = (...a) => bus.addEventListener(...a);
+  globalThis.dispatchEvent = (e) => bus.dispatchEvent(e);
+  globalThis.addEventListener('adv:ai-error', (e) => { e.preventDefault(); shown.push(e.detail); });
+  const [fetch0, timeout0] = [globalThis.fetch, C.AI_REQUEST_CONFIG.TIMEOUT_MS];
+  C.AI_REQUEST_CONFIG.TIMEOUT_MS = 50;
+  globalThis.fetch = (url, opts) => new Promise((_, rej) => opts.signal.addEventListener('abort', () => rej(new DOMException('This operation was aborted', 'AbortError'))));
+  const keys = [...new Set(Object.values(C.CLOUD_PROVIDERS).filter(p => p.baseUrl && !p.baseUrl.includes('openrouter')).map(C.cloudKeyStorageName))].map(k => [k, localStorage.getItem(k)]);
+  for (const [k] of keys) localStorage.removeItem(k);
+  Router.reset();
+  let err = null;
+  try { await ask(); } catch (e) { err = e; }
+  check(err && /OpenRouter didn't answer within/.test(err.message) && !/aborted\)/.test(err.message), `OpenRouter only, never answers: the error names it and the timeout (${err?.message})`);
+  check(shown.length === 1 && shown[0] === err?.message && err?.notified === true, 'the failure is announced once (adv:ai-error) and marked notified');
+  localStorage.setItem('adv.apiKey.generativelanguage.googleapis.com', 'g-key');
+  Router.reset(); shown.length = 0; err = null;
+  try { await ask(); } catch (e) { err = e; }
+  check(/No storyteller answered \(Google AI Studio: no answer within .*; OpenRouter: no answer within/.test(err?.message || '') && shown.length === 1, `Google and OpenRouter both time out: each is named (${err?.message})`);
+  globalThis.fetch = async () => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => ({ choices: [{ message: { content: '' }, finish_reason: 'length' }] }) });
+  Router.reset(); shown.length = 0; err = null;
+  try { await ask(); } catch (e) { err = e; }
+  check(err && !err.notified && shown.length === 0, 'an unusable reply is not a connection failure: no announcement (the turn retries it)');
+  for (const [k, v] of keys) if (v != null) localStorage.setItem(k, v);
+  [globalThis.fetch, C.AI_REQUEST_CONFIG.TIMEOUT_MS, globalThis.addEventListener, globalThis.dispatchEvent] = [fetch0, timeout0, ael, de];
+  Router.reset();
 }
 
 console.log(failed ? `✗ ${failed} FAILOVER CHECK(S) FAILED` : '✓ failover checks pass');
