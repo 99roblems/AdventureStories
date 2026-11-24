@@ -195,7 +195,7 @@ export function showPopup(message, type = 'info', duration = 3000) {
     // Queue lives in this module, not gameState: it was saved with the game,
     // and a reloaded queue of 18 stale toasts never started again.
     popupQueue.push({ message, type, duration });
-    // Keep it current, but never drop level-ups, victories or loot (legendary/success).
+    // Keep it current, but never drop level-ups, victories, loot or captures (legendary/success/item/capture).
     while (popupQueue.length > 4) {
         const i = popupQueue.findIndex((p, j) => j > 0 && !['legendary', 'success', 'item', 'capture'].includes(p.type));
         if (i === -1) break;
